@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-torneko_lz_tool.py
+torneko_lz_tool.py 
 LZ tool for PSX game 'World of Dragon Warrior - Torneko - The Last Hope (USA)'
 At least some of game's graphics is compressed with LZSS scheme.
 Flag byte, containing 8 bits:
@@ -14,18 +14,43 @@ Compressor features:
  - greedy match selection but with 1-token lookahead (lazy matching) to avoid common greedy mistakes
  - flag-group state persists across blocks (so repeated block-copies pack into the same flag byte)
 
+Supports two modes: --bpp {8,4} CLI option. Default is 8 (original behavior).
+ - 8bpp: image = 0x10000 bytes, block/history = 256
+ - 4bpp: image = 0x8000  bytes, block/history = 128
+
+Compressor: greedy + 1-token lazy lookahead (unchanged algorithm) but uses dynamic sizes.
+Decompressor: unchanged semantics but uses dynamic sizes and correct wrapping.
 """
 from typing import Tuple
 import argparse
 import os
 import sys
 
-FULL_IMAGE_SIZE = 0x100 * 0x100
+# default values (will be overridden by set_mode according to --bpp)
+FULL_IMAGE_SIZE = 0x100 * 0x100  # 65536
 BLOCK_SIZE = 256
 MAX_HISTORY = 256
+HISTORY_MASK = MAX_HISTORY - 1
 
+# internal constants used by algorithm defaults for compressors
+# (they will be used via the globals above after set_mode)
 class PSXLZError(Exception):
     pass
+
+def set_mode(bpp: int):
+    """Set global sizes based on bpp (4 or 8)."""
+    global FULL_IMAGE_SIZE, BLOCK_SIZE, MAX_HISTORY, HISTORY_MASK
+    if bpp == 8:
+        FULL_IMAGE_SIZE = 0x100 * 0x100  # 65536
+        BLOCK_SIZE = 256
+        MAX_HISTORY = 256
+    elif bpp == 4:
+        FULL_IMAGE_SIZE = 0x8000  # 32768
+        BLOCK_SIZE = 128
+        MAX_HISTORY = 128
+    else:
+        raise PSXLZError("Unsupported bpp (expected 4 or 8)")
+    HISTORY_MASK = MAX_HISTORY - 1
 
 def parse_offset(s: str) -> int:
     try:
@@ -33,21 +58,27 @@ def parse_offset(s: str) -> int:
     except ValueError:
         raise argparse.ArgumentTypeError(f"Invalid offset: {s}")
 
+def ensure_file_readable(path: str):
+    if not os.path.isfile(path):
+        raise PSXLZError(f"Input file not found: '{path}'")
+    if not os.access(path, os.R_OK):
+        raise PSXLZError(f"Input file not readable: '{path}'")
+
 # ---------------------------
 # Decompression
 # ---------------------------
 def decompress_from_file(in_filename: str, offset: int, out_filename: str) -> None:
+    ensure_file_readable(in_filename)
     if offset < 0:
         raise PSXLZError("Offset must be non-negative")
-    if not os.path.isfile(in_filename):
-        raise PSXLZError(f"Input file not found: {in_filename}")
     with open(in_filename, "rb") as f:
         f.seek(0, os.SEEK_END)
         size = f.tell()
         if offset >= size:
-            raise PSXLZError(f"Offset {offset} is beyond end of file (size {size})")
+            raise PSXLZError(f"Offset 0x{offset:x} beyond end of file (size 0x{size:x})")
         f.seek(offset)
         data = f.read()
+
     out, consumed = decompress_bytes_to_exact(data, FULL_IMAGE_SIZE)
     with open(out_filename, "wb") as fo:
         fo.write(bytes(out))
@@ -58,18 +89,21 @@ def decompress_bytes_to_exact(data: bytes, target_len: int) -> Tuple[bytearray,i
         return bytearray(), 0
     if not data:
         raise PSXLZError("No input data to decompress")
-
     p = 0
     src_len = len(data)
+    if src_len < 1:
+        raise PSXLZError("Compressed data too small (no header)")
     header = data[p]; p += 1
+
     out = bytearray()
     history = bytearray([0] * MAX_HISTORY)
     plain_buf = bytearray()
 
+    # raw mode: header == 0x23
     if header == 0x23:
         remaining = data[p:]
         if len(remaining) < target_len:
-            raise PSXLZError(f"Raw mode: need {target_len} bytes but only {len(remaining)} available after header")
+            raise PSXLZError(f"Raw mode: need 0x{target_len:x} bytes but only 0x{len(remaining):x} available after header")
         out.extend(remaining[:target_len])
         consumed = 1 + target_len
         return out, consumed
@@ -80,11 +114,12 @@ def decompress_bytes_to_exact(data: bytes, target_len: int) -> Tuple[bytearray,i
     while len(out) < target_len:
         if flag_mask == 0:
             if p >= src_len:
-                raise PSXLZError(f"Compressed stream ended prematurely after producing {len(out)} bytes (need {target_len})")
+                raise PSXLZError(f"Compressed stream ended prematurely after producing 0x{len(out):x} bytes (need 0x{target_len:x})")
             flag_byte = data[p]; p += 1
             flag_mask = 0x80
 
         if (flag_byte & flag_mask) == 0:
+            # literal
             flag_mask >>= 1
             if p >= src_len:
                 raise PSXLZError("Unexpected EOF while reading literal")
@@ -92,9 +127,11 @@ def decompress_bytes_to_exact(data: bytes, target_len: int) -> Tuple[bytearray,i
             out.append(b)
             plain_buf.append(b)
             if len(plain_buf) == BLOCK_SIZE:
+                # update history with last block
                 history[:] = plain_buf
                 plain_buf.clear()
         else:
+            # copy token
             flag_mask >>= 1
             if p + 1 >= src_len:
                 raise PSXLZError("Unexpected EOF while reading copy token")
@@ -102,14 +139,14 @@ def decompress_bytes_to_exact(data: bytes, target_len: int) -> Tuple[bytearray,i
             count = (len_byte + 3) & 0xFF
             if count == 0:
                 count = 0x100
-            idx = offset & 0xFF
+            idx = offset & HISTORY_MASK
             for _ in range(count):
                 if len(out) >= target_len:
                     break
                 b = history[idx]
                 out.append(b)
                 plain_buf.append(b)
-                idx = (idx + 1) & 0xFF
+                idx = (idx + 1) & HISTORY_MASK
                 if len(plain_buf) == BLOCK_SIZE:
                     history[:] = plain_buf
                     plain_buf.clear()
@@ -118,9 +155,8 @@ def decompress_bytes_to_exact(data: bytes, target_len: int) -> Tuple[bytearray,i
     return out, consumed
 
 # ---------------------------
-# Compressor (greedy + lazy + index)
+# Compressor helpers (dynamic sizes)
 # ---------------------------
-
 def build_history_index(history: bytearray):
     """Return positions_by_byte: list of lists for each byte value -> history positions"""
     positions_by_byte = [[] for _ in range(256)]
@@ -132,25 +168,24 @@ def build_history_index(history: bytearray):
 def find_best_match_at(history: bytearray, positions_by_byte, plain: bytes, pos: int, block_end: int):
     """
     Find best match (offset, length) in history for plain[pos:].
-    Returns (best_off, best_len) with best_len>=0. If no match >=3, best_len will be 0.
-    This checks only history offsets where first byte matches (fast).
+    Uses HISTORY_MASK for wrapping.
+    Returns (best_off, best_len) — best_len == 0 means no match >=3.
     """
+    if pos >= block_end:
+        return 0, 0
     first = plain[pos]
     cand_offsets = positions_by_byte[first]
     if not cand_offsets:
         return 0, 0
     remaining = block_end - pos
-    max_allowed = min(256, remaining)
+    max_allowed = min(256, remaining)  # token count limited to 256 in scheme
     best_len = 0
     best_off = 0
-    # For each candidate offset extend match
+    hist = history
+    p = pos
     for h in cand_offsets:
         cur_len = 1
-        # extend
-        # use local variables for speed
-        hist = history
-        p = pos
-        while cur_len < max_allowed and hist[(h + cur_len) & 0xFF] == plain[p + cur_len]:
+        while cur_len < max_allowed and hist[(h + cur_len) & HISTORY_MASK] == plain[p + cur_len]:
             cur_len += 1
         if cur_len > best_len:
             best_len = cur_len
@@ -165,17 +200,10 @@ def find_best_match_at(history: bytearray, positions_by_byte, plain: bytes, pos:
 
 def compress_bytes(plain: bytes) -> bytes:
     """
-    Improved compressor:
-     - pads input externally (caller ensures correct size)
-     - processes block-by-block, history updated after full block flush
-     - persistent flag-group across blocks
-     - greedy selection of best match in history, but uses 1-token lookahead (lazy match):
-         if best match at pos is len L0 >=3 and best at pos+1 is L1 > L0,
-         prefer to emit literal at pos (so next token can use the longer match).
-     - fast indexing via positions_by_byte for history to avoid scanning all 256 offsets every pos.
+    Greedy compressor with 1-token lazy lookahead
     """
     if len(plain) != FULL_IMAGE_SIZE:
-        raise PSXLZError("compress_bytes expects plain exactly FULL_IMAGE_SIZE (pad before calling)")
+        raise PSXLZError(f"compress_bytes expects plain exactly 0x{FULL_IMAGE_SIZE:x} bytes")
 
     out = bytearray()
     out.append(0x00)  # compressed header
@@ -212,17 +240,12 @@ def compress_bytes(plain: bytes) -> bytes:
             # lazy lookahead: check pos+1's best match, prefer literal now if it yields net benefit
             if best_len >= 3 and pos + 1 < block_end:
                 next_off, next_len = find_best_match_at(history, positions_by_byte, plain, pos + 1, block_end)
-                # heuristics: if next_len > best_len, prefer literal at pos to allow bigger match at pos+1
-                # This fixes common greedy mistakes. Also if next_len == best_len and best_len is small, no change.
+                # if next_len > best_len, choose literal to allow longer match next
                 if next_len > best_len:
-                    # emit literal instead of copy
-                    # note: we still allow copy if next_len is not sufficiently larger; this is conservative.
                     token_buf.append(plain[pos] & 0xFF)
                     pos += 1
                     flag_mask >>= 1
                 else:
-                    # use copy token
-                    # encode
                     len_byte = (best_len - 3) & 0xFF
                     token_buf.append(best_off & 0xFF)
                     token_buf.append(len_byte)
@@ -230,7 +253,7 @@ def compress_bytes(plain: bytes) -> bytes:
                     pos += best_len
                     flag_mask >>= 1
             elif best_len >= 3:
-                # no lookahead possible (end of block) or best_len is <3 at pos+1
+                # use copy token
                 len_byte = (best_len - 3) & 0xFF
                 token_buf.append(best_off & 0xFF)
                 token_buf.append(len_byte)
@@ -238,7 +261,7 @@ def compress_bytes(plain: bytes) -> bytes:
                 pos += best_len
                 flag_mask >>= 1
             else:
-                # no decent match -> literal
+                # literal
                 token_buf.append(plain[pos] & 0xFF)
                 pos += 1
                 flag_mask >>= 1
@@ -249,9 +272,8 @@ def compress_bytes(plain: bytes) -> bytes:
                 flag_byte_pos = None
                 out.extend(token_buf)
                 token_buf = bytearray()
-                # next token will start new flag group
 
-        # finished block: update history with the block contents (blocks are full because caller pads)
+        # finished block: update history with the block contents
         history[:] = plain[block_start:block_start + BLOCK_SIZE]
 
     # flush any remaining partial flag group
@@ -263,12 +285,11 @@ def compress_bytes(plain: bytes) -> bytes:
     return bytes(out)
 
 def compress_file(plain_filename: str, out_filename: str) -> None:
-    if not os.path.isfile(plain_filename):
-        raise PSXLZError(f"Plain file not found: {plain_filename}")
+    ensure_file_readable(plain_filename)
     with open(plain_filename, "rb") as f:
         plain = bytearray(f.read())
     if len(plain) > FULL_IMAGE_SIZE:
-        raise PSXLZError(f"Plain input too large: {len(plain)} bytes (max {FULL_IMAGE_SIZE})")
+        raise PSXLZError(f"Plain input too large: {len(plain)} bytes (max 0x{FULL_IMAGE_SIZE:x})")
     if len(plain) < FULL_IMAGE_SIZE:
         plain.extend(b'\x00' * (FULL_IMAGE_SIZE - len(plain)))
 
@@ -278,10 +299,11 @@ def compress_file(plain_filename: str, out_filename: str) -> None:
     print(f"Compressed 0x{len(plain):x} bytes -> 0x{len(comp):x} bytes in file '{out_filename}'")
 
 # ---------------------------
-# CLI 
+# CLI
 # ---------------------------
 def main():
     parser = argparse.ArgumentParser(description="PSX World of Dragon Warrior - Torneko - The Last Hope LZ tool")
+    parser.add_argument("--bpp", choices=["8", "4"], default="8", help="pixel mode: 8 (8bpp, default) or 4 (4bpp)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     pd = sub.add_parser("d", help="decompress: d <input_file> <offset> <output_file>")
@@ -294,6 +316,10 @@ def main():
     pc.add_argument("output_file")
 
     args = parser.parse_args()
+
+    # set mode before doing any work
+    set_mode(int(args.bpp))
+
     try:
         if args.cmd == "d":
             decompress_from_file(args.input_file, args.offset, args.output_file)
