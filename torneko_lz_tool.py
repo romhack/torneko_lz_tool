@@ -166,37 +166,38 @@ def build_history_index(history: bytearray):
     return positions_by_byte
 
 def find_best_match_at(history: bytearray, positions_by_byte, plain: bytes, pos: int, block_end: int):
-    """
-    Find best match (offset, length) in history for plain[pos:].
-    Uses HISTORY_MASK for wrapping.
-    Returns (best_off, best_len) — best_len == 0 means no match >=3.
-    """
     if pos >= block_end:
         return 0, 0
     first = plain[pos]
     cand_offsets = positions_by_byte[first]
     if not cand_offsets:
         return 0, 0
+
     remaining = block_end - pos
     max_allowed = min(256, remaining)  # token count limited to 256 in scheme
+
     best_len = 0
     best_off = 0
     hist = history
     p = pos
+
     for h in cand_offsets:
+        contiguous_limit = min(max_allowed, MAX_HISTORY - h)
         cur_len = 1
-        while cur_len < max_allowed and hist[(h + cur_len) & HISTORY_MASK] == plain[p + cur_len]:
+        while cur_len < contiguous_limit and hist[h + cur_len] == plain[p + cur_len]:
             cur_len += 1
         if cur_len > best_len:
             best_len = cur_len
             best_off = h
             if best_len == max_allowed:
                 break
+
     if best_len < 3:
         return 0, 0
     if best_len > 256:
         best_len = 256
     return best_off, best_len
+
 
 def compress_bytes(plain: bytes) -> bytes:
     """
